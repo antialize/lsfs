@@ -17,3 +17,6 @@ install(TARGETS lsfs mkfs.lsfs lsfs.fuse
   RUNTIME DESTINATION bin
   LIBRARY DESTINATION lib
   )
+
+install(FILES lsfs.hh DESTINATION include)
+
