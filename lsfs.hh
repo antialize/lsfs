@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include <pthread.h>
+
 namespace lsfs {
 
 	class FS;
@@ -34,14 +36,24 @@ namespace lsfs {
     };
 
 	class ErrnoException: public std::exception {
+    private:
+		char buff[2048];
 	public:
 		int number;
-		ErrnoException(int _): number(_) {};
-		const char * what() const throw () {return "Numbered exception";}
+		inline ErrnoException(int _, int line, const char * file, const char * format, ...) : number(_) {
+			va_list ap;
+			va_start(ap, format);
+			int i=snprintf(buff, 2048, "%s: %d\n",file,line);
+			i+=snprintf(buff+i, 2048-i, "%d: %s\n",number,strerror(number));
+			vsnprintf(buff+i, 2048-i, format, ap);
+			va_end(ap);
+		};
+		const char * what() const throw () {return buff;}
 	};
 		
     class File {
     public:
+
 		std::string name;
 		uint64_t usage;
 		std::vector<std::pair<uint64_t,uint64_t> > chunks;
@@ -58,6 +70,7 @@ namespace lsfs {
 		FS * fs;
 		uint64_t cl;
 		uint64_t chunk;
+		bool readOnly;
 		void allocate(uint64_t size);
 		void seekset();
     public:
@@ -78,6 +91,8 @@ namespace lsfs {
 	typedef std::set<std::pair<uint64_t,uint64_t> > freespace_t;
     class FS {
     private:
+		pthread_mutex_t mutex;
+		
 		friend class Handle;
 		files_t files;
 		filelist_t filelist;
@@ -85,7 +100,7 @@ namespace lsfs {
 		std::string path;
 		uint64_t _size;
 		
-		int inotifyfd;
+		//int inotifyfd;
 		bool readonly;
 		uint64_t maxfiles;
 		uint64_t maxchunks;
@@ -99,6 +114,8 @@ namespace lsfs {
 		int getFd();
 		void compressFreeSpace();
     public:
+		FS();
+		~FS();
 		static void create(const std::string & path, uint64_t maxfiles=1000, uint64_t maxchunks=128);
 		void mount(const std::string & path, bool readOnly, bool ignorewm=false);
 		void umount();

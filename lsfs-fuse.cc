@@ -9,6 +9,7 @@
 
 #define HANDLE_EXCEPTIONS                        \
   catch(const lsfs::ErrnoException & e) {        \
+    std::cerr << e.what() << std::endl;          \
     return -e.number;                            \
   } catch(const lsfs::InternalError & e) {       \
     std::cerr << e.what() << std::endl;          \
@@ -79,27 +80,21 @@ static int lsfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     std::string prefix=path+1;
     if(prefix != "") prefix.push_back('/');
     const std::set<std::string> &  l = fs.ls();
-    
-    std::cout << prefix << std::endl;
-    
     std::set<std::string> files;
     for(
 	std::set<std::string>::const_iterator i = l.lower_bound(prefix);
 	i != l.end();
 	++i) {
-      
       if(i->substr(0,prefix.size()) != prefix) break;
       size_t e=i->find('/',prefix.size());
       if(e != std::string::npos) e -= prefix.size();
       std::string x = i->substr(prefix.size(),e);
       if(x.size()) files.insert(x);
     }
-    
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
     for( std::set<std::string>::const_iterator i = files.begin(); i != files.end(); ++i)
       filler(buf, i->c_str(), NULL, 0);
-    
     return 0;
   } HANDLE_EXCEPTIONS
 }
@@ -119,7 +114,6 @@ int lsfs_create(const char * path, mode_t, struct fuse_file_info * fi) {
 
 int lsfs_read(const char *, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-  std::cout << "Read" << std::endl;
   try {
     lsfs::Handle * h = reinterpret_cast<lsfs::Handle*>(static_cast<size_t>(fi->fh));
     h->seek(offset);
@@ -129,7 +123,6 @@ int lsfs_read(const char *, char *buf, size_t size, off_t offset, struct fuse_fi
 
 int lsfs_write(const char *, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-  std::cout << "Write" << std::endl;
   try {
     lsfs::Handle * h = reinterpret_cast<lsfs::Handle*>(static_cast<size_t>(fi->fh));
     h->seek(offset);
@@ -158,14 +151,71 @@ int lsfs_truncate(const char * path, off_t size) {
 }
 
 
-// int mfs_flush(const char *, struct fuse_file_info * fi) {
-//     return 0;
-// }
-
 static struct fuse_operations lsfs_oper;
+enum {
+  KEY_HELP,
+  KEY_VERSION,
+};
+
+//#define MYFS_OPT(t, p, v) { t, offsetof(struct myfs_config, p), v }
+
+static struct fuse_opt myfs_opts[] = {
+  {"readonly", 0, 1},
+  {"-r", 0, 1},
+  {"--readonly", 0, 1},
+   FUSE_OPT_KEY("-V",             KEY_VERSION),
+   FUSE_OPT_KEY("--version",      KEY_VERSION),
+   FUSE_OPT_KEY("-h",             KEY_HELP),
+   FUSE_OPT_KEY("--help",         KEY_HELP),
+   {NULL, -1 ,0}
+};
+
+
+char * dev;
+#include <cstdlib>
+
+static int lsfs_opt_proc(void *data, const char *arg, int key, struct fuse_args *outargs)
+{
+  switch(key)  {
+  case KEY_VERSION:
+    fprintf(stderr, "lsfs version: 0.1\n");
+    fuse_opt_add_arg(outargs, "--version");
+    fuse_main(outargs->argc, outargs->argv, &lsfs_oper, NULL);
+    exit(0);
+  case KEY_HELP:
+    fprintf(stderr,
+	    "usage: %s device mountpoint [options]\n"
+	    "\n"
+	    "general options:\n"
+	    "    -o opt,[opt...]  mount options\n"
+	    "    -h   --help      print help\n"
+	    "    -V   --version   print version\n"
+	    "\n"
+	    "lsfs options:\n"
+	    "    -o readonly\n"
+	    "    -r NUM           same as '-o readonly'\n"
+	    "    --readonly       same as '-o readonly'\n"
+	    "\n"
+	    , outargs->argv[0]);
+    fuse_opt_add_arg(outargs, "-ho");
+    fuse_main(outargs->argc, outargs->argv, &lsfs_oper, NULL);
+    exit(1);
+  case FUSE_OPT_KEY_NONOPT:
+    if(dev == NULL) {
+      dev = strdup(arg);
+      return 0;
+    }
+    break;
+  }
+  return 1;
+}
+
+size_t readonly;
 
 int main(int argc, char *argv[])
 {
+  readonly = 0;
+
   memset(&lsfs_oper, 0, sizeof(struct fuse_operations));
   lsfs_oper.readdir = lsfs_readdir;
   lsfs_oper.mkdir = lsfs_mkdir;
@@ -179,14 +229,9 @@ int main(int argc, char *argv[])
   lsfs_oper.release = lsfs_release;
   lsfs_oper.utimens = lsfs_utimens;
   lsfs_oper.truncate = lsfs_truncate;
-  struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
-  const char * file;
-  for(int i = 0; i < argc; i++) {
-    if (i == 1)
-      file = argv[i];
-    else
-      fuse_opt_add_arg(&args, argv[i]);
-  }
-  fs.mount(file,false);
+
+  struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+  fuse_opt_parse(&args, &readonly, myfs_opts, lsfs_opt_proc);
+  fs.mount(dev,readonly);
   return fuse_main(args.argc, args.argv, &lsfs_oper, NULL);
 }

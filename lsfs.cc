@@ -13,13 +13,14 @@
 #include <fcntl.h>
 #include <cassert>
 #include <iostream>
+#include <memory>
 
 namespace {
 #define THROW_PE(FORMAT, ...) throw lsfs::InternalError(__LINE__,__FILE__,true, FORMAT, ##__VA_ARGS__, NULL)
 #define THROW_E(FORMAT, ...) throw lsfs::InternalError(__LINE__,__FILE__,false, FORMAT, ##__VA_ARGS__, NULL)
 
-#define THROW_ERRNO(FORMAT, ...) throw lsfs::ErrnoException(errno);
-#define THROW_ERRNOG(err, FORMAT, ...) throw lsfs::ErrnoException(err);
+#define THROW_ERRNO(FORMAT, ...) throw lsfs::ErrnoException(errno,__LINE__,__FILE__,FORMAT, ##__VA_ARGS__, NULL)
+#define THROW_ERRNOG(err, FORMAT, ...) throw lsfs::ErrnoException(err,__LINE__,__FILE__,FORMAT,  ##__VA_ARGS__, NULL)
 
     struct fdw {
 	int x;
@@ -30,19 +31,13 @@ namespace {
     };
     const uint64_t magic = 0xCAFEBABEDEADBEEF;
 
-    template <typename T> 
-    struct ptrw {
-	T * p;
-	ptrw(T * _=NULL): p(_) {};
-	~ptrw() {if(p != NULL) delete p;}
-	operator T*() {return p;}
-	T * operator=(T * _) {
-	    if(p != NULL) delete p;
-	    p = _;
-	}
-	void release() {p=NULL;}
+    struct lock {
+	pthread_mutex_t * m;
+	bool rl;
+	inline lock(pthread_mutex_t * _, bool __=true): m(_), rl(__) {if(rl) pthread_mutex_lock(m);}
+	inline ~lock() {if(rl) pthread_mutex_unlock(m);}
     };
-        
+	    
 #pragma pack(push, 1)
     struct header_t {
 	uint64_t magic;
@@ -110,10 +105,10 @@ namespace lsfs {
 	
 	freespace_t::iterator o=used.begin();
 	freespace_t::iterator i=o;
-	std::cout << "Free space:" << std::endl;
+	//std::cout << "Free space:" << std::endl;
 	for(++i; i != used.end(); ++i) {
 	    if(o->second != i->first) {
-		std::cout << "   " << o->second << " " << i->first << std::endl;
+		//std::cout << "   " << o->second << " " << i->first << std::endl;
 		freespace.insert( std::make_pair(o->second, i->first) );
 	    }
 	    o=i;
@@ -139,25 +134,29 @@ namespace lsfs {
 
     inline void Handle::seekset() {
 	if(chunk == (uint64_t)-1) return; 
+	//std::cout << file->chunks.size() << " " << chunk << " " << cl << " " << file->chunks[chunk].first+cl << std::endl;
 	if(lseek(fd,file->chunks[chunk].first+cl, SEEK_SET) == -1) THROW_ERRNO("lseek");
     }
     
     void Handle::seek(uint64_t where) {
+	lock l(&this->fs->mutex, !this->fs->readonly);
 	if(where == 0 && file->chunks.empty()) return;
 	cl = where;
 	for(chunk=0; chunk < file->chunks.size(); ++chunk) {
 	    size_t s = file->chunks[chunk].second - file->chunks[chunk].first;
-	    if(s < cl) {cl -= s; continue;}
+	    if(s <= cl) {cl -= s; continue;}
 	    seekset();
 	    return;
 	}
-	THROW_ERRNOG(EINVAL,"Bad location");
+	if(cl != 0) THROW_ERRNOG(EINVAL,"Bad location");
+	chunk=(uint64_t)-1;
     }
 
 
     void Handle::allocate(uint64_t size) {
 	if(size == 0) return;
-	std::cout << ">> Allocate" << std::endl;
+	//std::cout << ">> Allocate(" << size << ")" << std::endl;
+	//std::cout << file->chunks.size() << " " << chunk << std::endl;
 	if(file->chunks.size() > 0) { //Try to expand the last chunk
 	    uint64_t p = file->chunks.back().second;
 	    freespace_t::iterator i = fs->freespace.lower_bound( std::make_pair(p,p) );
@@ -172,14 +171,14 @@ namespace lsfs {
 		if(start+s != end) fs->freespace.insert(std::make_pair(start+s,end));
 	    }
 	}
+	//std::cout << file->chunks.size() << " " << chunk << std::endl;
 	while(size > 0) {
-	    std::cout << " .." << std::endl;
+	    // std::cout << " .." << std::endl;
 	    freespace_t::iterator best=fs->freespace.begin();
 	    for(freespace_t::iterator i=best; i != fs->freespace.end(); ++i)
 		if(i->second - i->first > best->second - best->first) best=i;
 	    if(best == fs->freespace.end()) {
 		fs->writeFile(fd, file);
-		seekset();
 		THROW_ERRNOG(ENOSPC, "No space left on device");
 	    }
 	    uint64_t start=best->first;
@@ -190,13 +189,15 @@ namespace lsfs {
 	    size -= s;
 	    if(start+s != end) fs->freespace.insert(std::make_pair(start+s,end));
 	}
+	//std::cout << file->chunks.size() << " " << chunk << std::endl;
 	fs->writeFile(fd, file);
-	seekset();
-	std::cout << "<< Allocate" << std::endl;
+	//std::cout << "<< Allocate" << std::endl;
     }
     
     void Handle::truncate(uint64_t size) {
-	std::cout << ">>truncate " << fd << " " << size<< std::endl;
+	if(readOnly || this->fs->readonly) THROW_ERRNOG(EROFS, "Readonly file or fs");
+	lock l(&this->fs->mutex);
+	//std::cout << ">>truncate " << fd << " " << size<< std::endl;
 	size_t c=0;
 	while(size > 0 && c < file->chunks.size()) {
 	    std::pair<uint64_t, uint64_t> & cc = file->chunks[c];
@@ -216,17 +217,14 @@ namespace lsfs {
 	fs->compressFreeSpace();
 
 	if(size > 0) allocate(size);
-	else {
-	    fs->writeFile(fd, file);
-	    seekset();
-	}
+	else fs->writeFile(fd, file);
 	chunk = (uint64_t)-1;
 	cl = 0;
 	if(file->chunks.size() > 0) {
 	    if(lseek(fd,file->chunks[0].first,SEEK_SET) == -1) THROW_PE("lseek");
 	    chunk = 0;
 	}
-	std::cout << "<<truncate" << std::endl;
+	//std::cout << "<<truncate" << std::endl;
     }
 
     Handle::Handle(const Handle & h) {
@@ -239,7 +237,9 @@ namespace lsfs {
     }
 
     uint64_t Handle::read(uint8_t * buf, uint64_t size) {
-	std::cout << ">>Read" << std::endl;
+	lock l(&this->fs->mutex, !this->fs->readonly);
+	
+	//std::cout << ">>Read" << std::endl;
 	uint64_t read=0;
 	while(size > 0) {
 	    if(chunk == (uint64_t)-1) break;
@@ -255,14 +255,16 @@ namespace lsfs {
 	    cl = 0;
 	    if(lseek(fd,file->chunks[chunk].first,SEEK_SET) == -1) THROW_PE("lseek");
 	}
-	std::cout << "<<Read" << std::endl;
+	//std::cout << "<<Read" << std::endl;
 	return read;
     }
     
     void Handle::write(const uint8_t * buf, uint64_t size) {
-	std::cout << ">>Write" << std::endl;
+	if(readOnly || this->fs->readonly) THROW_ERRNOG(EROFS, "Readonly file or fs");
+	lock l(&this->fs->mutex);
+	//std::cout << ">>Write " << chunk << " "  << size << std::endl;
 	while(size > 0) {
-	    std::cout << "  .." << size << std::endl;
+	    //std::cout << "  .. " << chunk << " "  << size << std::endl;
 	    if(chunk == (uint64_t)-1) {
 		chunk = file->chunks.size();
 		uint64_t end=0;
@@ -271,7 +273,7 @@ namespace lsfs {
 		cl=0;
 		if(chunk > 0 && file->chunks[chunk-1].second > end ) {
 		    --chunk;
-		    cl = end-file->chunks[chunk-1].first;
+		    cl = end-file->chunks[chunk].first;
 		}
 		seekset();
 	    }
@@ -281,25 +283,40 @@ namespace lsfs {
 	    if(::write(fd,buf,r) != r) THROW_PE("write");
 	    size -= r;
 	    buf += r;
-	    if(r < cr) {cl -= r; break;}
+	    if(r < cr) {cl += r; break;}
 	    chunk++;
 	    cl = 0;
 	    if(chunk == file->chunks.size()) {chunk=(uint64_t)-1; continue;}
 	    seekset();
 	}
-	std::cout << "<<Write" << std::endl;
+	//std::cout << "<<Write " << chunk << " "  << size << std::endl;
+    }
+
+    FS::FS() {
+	pthread_mutex_init(&mutex,NULL);
+    }
+
+
+    FS::~FS() {
+	pthread_mutex_destroy(&mutex);
     }
 
     uint64_t FS::size(const std::string & name) {
+	lock l(&mutex, !this->readonly);
 	files_t::iterator i = files.find(name);
 	if(i == files.end()) THROW_ERRNOG(ENOENT,"File not found");
 	return i->second->size();
     }
+    
 
     Handle * FS::open(const std::string & name, bool readOnly, Handle * h) {
-	ptrw<Handle> nh;
-	if(h == NULL) h = nh = new Handle();
-	
+	//std::cout << ">> Open" << std::endl;
+	std::auto_ptr<Handle> nh;
+	if(h == NULL) {
+	    nh = std::auto_ptr<Handle>(new Handle());
+	    h = nh.get();
+	}
+	lock l(&mutex, !this->readonly);
 	files_t::iterator i = files.find(name);
 	File * file;
 	
@@ -317,11 +334,11 @@ namespace lsfs {
 	    writeHeader(fd);
 	} else 
 	    file = i->second;
-
 	file->usage++;
 	h->fs = this;
 	h->fd = fd;
 	h->file = file;
+	h->readOnly = readOnly;
 	h->chunk = (uint64_t)-1;
 	h->cl = 0;
 	if(file->chunks.size() > 0) {
@@ -330,6 +347,7 @@ namespace lsfs {
 	}
 	fd.release();
 	nh.release();
+	//std::cout << "<< Open" << std::endl;
 	return h;
     }
 
@@ -376,7 +394,7 @@ namespace lsfs {
     }
 
     void FS::compressFreeSpace() {
-	std::cout << ">>compression" << std::endl;
+	//std::cout << ">>compression" << std::endl;
 	if(freespace.empty()) return;
 	freespace_t::iterator a=freespace.begin();
 	freespace_t::iterator b=a;
@@ -395,11 +413,12 @@ namespace lsfs {
 	    a = b = i;
 	    if(i == freespace.end()) break;
 	}
-	std::cout << "<<compression" << std::endl;
+	//std::cout << "<<compression" << std::endl;
     }
-									       
+    
     void FS::unuse(File * file) {
 	file->usage--;
+	//std::cout << "Usage " << file->name << " " << file->usage << std::endl;
 	if(file->usage == 0) {
 	    for(size_t i=0; i != file->chunks.size(); ++i)
 		freespace.insert(file->chunks[i]);
@@ -423,6 +442,7 @@ namespace lsfs {
 
     void FS::unlink(const std::string & name) {
 	if(readonly) THROW_ERRNOG(EROFS, "Readonly file or fs");
+	lock l(&mutex);
 	files_t::iterator i = files.find(name);
 	if(i == files.end()) THROW_ERRNOG(ENOENT,"File not found");
 	
