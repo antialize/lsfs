@@ -12,6 +12,7 @@ target_link_libraries(mkfs.lsfs ${Boost_LIBRARIES}  lsfs)
 add_executable(lsfs.fuse lsfs-fuse.cc)
 target_link_libraries(lsfs.fuse lsfs -lfuse)
 
+add_executable(bench bench.c)
 
 install(TARGETS lsfs mkfs.lsfs lsfs.fuse
   RUNTIME DESTINATION bin
