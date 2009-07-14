@@ -29,7 +29,7 @@ namespace {
 	operator int() {return x;}
 	void release() {x=-1;}
     };
-    const uint64_t magic = 0xCAFEBABEDEADBEEF;
+    const uint64_t magic = 0xCAFEBABEDEADBEEFll;
 
     struct lock {
 	pthread_mutex_t * m;
